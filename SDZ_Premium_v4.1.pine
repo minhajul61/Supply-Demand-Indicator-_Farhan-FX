@@ -1,0 +1,848 @@
+//@version=5
+// S/D Zones PREMIUM v4.1 - Farhan FX
+// Base: S/D Zones Premium Final v3.0 (same non-repainting multi-TF zone engine).
+// v4 adds:
+//   * Trade engine: BUY/SELL on zone rejection (confirmed bar close), SL beyond zone far edge + ATR buffer,
+//     TP1 / TP2 / TP3 as R-multiples, 1/3 partial at each TP, SL -> breakeven after TP1 (optional), time exit.
+//   * Built-in backtest on the whole loaded chart history: win rate (TP1 before SL), TP2/TP3 hit rate, net R,
+//     profit factor, max losing streak. Conservative: if SL and TP are touched in the same candle, SL counts first.
+//   * Dashboard: status, live trade levels, next BUY zone / SELL zone with ready Entry/SL/TP1-3 plan, trend, stats.
+//   * Zone quality filters: leg-out strength (impulse must clear the zone) and max SL size.
+//   * Dynamic alerts (alert()) with Entry / SL / TP1 / TP2 / TP3 prices.
+// v4.1 tuning (FX:XAUUSD backtest, Nov 2026): multi-TF zones (chart + H4 + D), signals from all slots, Fast preset,
+// "Close + body in direction", trend filter = H1 EMA200, max zone height 1.5 ATR, overlapping zones -> newest kept.
+// Trend TF auto: H1+ charts use their own TF, lower charts use H4. H1: 322 trades, 59.3%, PF 1.60 | M15: 282 trades, 52.8%, PF 1.21.
+// Everything is evaluated on confirmed (closed) candles only -> no repainting of signals or stats.
+indicator("S/D Zones Premium v4.1", shorttitle="SDZ v4.1", overlay=true, max_boxes_count=500, max_lines_count=100, max_labels_count=100, max_bars_back=200)
+
+// ---------------- Style ----------------
+grpS = "Style"
+theme      = input.string("Premium", "Theme", options=["Premium", "Classic"], group=grpS)
+premDem    = input.color(#26C6DA, "Premium demand colour", group=grpS, inline="pc")
+premSup    = input.color(#EF5350, "Premium supply colour", group=grpS, inline="pc")
+zoneTr     = input.int(82, "Zone transparency (0-100)", minval=0, maxval=100, group=grpS)
+testedFade = input.int(8, "Extra transparency once tested", minval=0, maxval=50, group=grpS)
+showBorder = input.bool(true, "Zone border", group=grpS, inline="bd")
+borderTr   = input.int(55, "transparency", minval=0, maxval=100, group=grpS, inline="bd")
+extRight   = input.bool(true, "Extend zones to the right", group=grpS)
+showLbl    = input.bool(true, "Show zone text", group=grpS)
+demTxt     = input.string("DEMAND", "Demand text", group=grpS, inline="tx")
+supTxt     = input.string("SUPPLY", "Supply text", group=grpS, inline="tx")
+tfPrefix   = input.bool(true, "TF prefix on higher-TF zones (e.g. 'H4 SUPPLY')", group=grpS)
+lblSizeIn  = input.string("Small", "Text size", options=["Tiny", "Small", "Normal"], group=grpS)
+lblCol     = input.color(color.new(#E0E3EB, 10), "Text colour", group=grpS)
+nearestN   = input.int(2, "Clean view: nearest N zones per side per TF (0 = all)", minval=0, maxval=40, group=grpS)
+
+// ---------------- Gradient cloud ----------------
+grpG = "Gradient cloud"
+cloudOn   = input.bool(false, "Show gradient cloud", group=grpG)
+cloudMode = input.string("Stdev", "Width", options=["Stdev", "ATR"], group=grpG)
+cloudLen  = input.int(40, "Basis EMA / width length", minval=2, group=grpG)
+cloudSm   = input.int(5, "Smoothing", minval=1, maxval=50, group=grpG)
+innerM    = input.float(2.0, "Inner edge (x width)", minval=0.1, step=0.1, group=grpG)
+outerM    = input.float(3.5, "Outer edge (x width)", minval=0.2, step=0.1, group=grpG)
+cloudUp   = input.color(#26A69A, "Upper cloud", group=grpG, inline="cc")
+cloudDn   = input.color(#B2B5BE, "Lower cloud", group=grpG, inline="cc")
+cloudMax  = input.int(35, "Strongest opacity", minval=0, maxval=100, group=grpG)
+cloudEdge = input.bool(false, "Draw cloud edge lines", group=grpG)
+
+// ---------------- BUY / SELL signals ----------------
+grpB = "BUY / SELL signals"
+showSig   = input.bool(true, "Enable BUY/SELL signals + trade engine", group=grpB, tooltip="After the first touch of a fresh zone, a candle that trades into the zone and closes back outside it (within the confirmation window) = signal. Entry at that candle's close.")
+sigSrc    = input.string("All slots", "Signals from", options=["Slot 1 zones", "All slots"], group=grpB)
+confType  = input.string("Close + body in direction", "Confirmation", options=["Close back outside", "Close + body in direction", "Pin bar"], group=grpB)
+wickRatio = input.float(0.5, "Pin bar: min rejection wick (x bar range)", minval=0.1, maxval=0.95, step=0.05, group=grpB)
+confBars  = input.int(3, "Confirmation window (bars after first touch)", minval=0, maxval=50, group=grpB)
+sigTrend  = input.bool(true, "Signals: HTF EMA trend filter", group=grpB, tooltip="BUY only when close > HTF EMA, SELL only when close < HTF EMA (settings in 'Common').")
+useSess   = input.bool(false, "Signals: session filter", group=grpB, inline="ss")
+sessStr   = input.session("0700-2000", "UTC", group=grpB, inline="ss")
+buyCol    = input.color(#26A69A, "BUY", group=grpB, inline="mc")
+sellCol   = input.color(#EF5350, "SELL", group=grpB, inline="mc")
+
+// ---------------- Trade plan ----------------
+grpT = "Trade plan (SL / TP)"
+slBuf    = input.float(0.25, "SL buffer beyond zone (x ATR)", minval=0.0, step=0.05, group=grpT)
+maxSlAtr = input.float(3.0, "Skip trade if SL distance > x ATR (0 = off)", minval=0.0, step=0.25, group=grpT)
+tp1R     = input.float(1.0, "TP1 (R multiple)", minval=0.1, step=0.1, group=grpT, inline="tp")
+tp2R     = input.float(2.0, "TP2", minval=0.1, step=0.1, group=grpT, inline="tp")
+tp3R     = input.float(3.0, "TP3", minval=0.1, step=0.1, group=grpT, inline="tp")
+beOn     = input.bool(true, "Move SL to entry (breakeven) after TP1", group=grpT)
+trailOn  = input.bool(true, "Move SL to TP1 after TP2", group=grpT)
+maxHold  = input.int(120, "Time exit after N bars (0 = off)", minval=0, group=grpT)
+showLv   = input.bool(true, "Draw Entry / SL / TP lines", group=grpT)
+showHist = input.bool(false, "Show past signals (history)", group=grpT, tooltip="OFF = only the live trade is drawn (marker + Entry/SL/TP). Backtest stats still use the full history.")
+showDash = input.bool(true, "Show dashboard", group=grpT)
+dashPos  = input.string("Bottom right", "Dashboard position", options=["Bottom right", "Bottom left", "Top right", "Top left"], group=grpT)
+dashSize = input.string("Small", "Dashboard text size", options=["Tiny", "Small", "Normal"], group=grpT)
+
+// ---------------- Presets ----------------
+presetMode = input.string("Shared", "Preset mode", options=["Shared", "Per slot"])
+presetAll  = input.string("Fast", "Shared preset", options=["Fast", "Balanced", "High quality", "Manual"], tooltip="Fast: impulse >= 1.0 ATR over up to 3 candles. Balanced: single candle >= 1.5 ATR. High quality: impulse >= 2.5 ATR over up to 3 candles, zone height 0.5-1.0 ATR. Manual: 'Manual settings'.")
+
+grpM = "Manual settings (preset = Manual)"
+mImp     = input.float(1.5, "Impulse: net move >= x ATR", minval=0.1, step=0.1, group=grpM)
+mMaxImp  = input.int(1, "Impulse: max consecutive candles", minval=1, maxval=5, group=grpM)
+mBase    = input.float(0.7, "Base candle body <= x ATR", minval=0.05, step=0.05, group=grpM)
+mMaxBase = input.int(3, "Max base candles", minval=1, maxval=10, group=grpM)
+mHmin    = input.float(0.0, "Min zone height (x ATR, 0 = off)", minval=0.0, step=0.1, group=grpM)
+mHmax    = input.float(0.0, "Max zone height (x ATR, 0 = off)", minval=0.0, step=0.1, group=grpM)
+mRatio   = input.float(0.0, "Min impulse move / zone height (0 = off)", minval=0.0, step=0.5, group=grpM)
+
+// ---------------- Timeframe slots ----------------
+g1 = "Slot 1"
+en1  = input.bool(true, "Enable", group=g1, inline="a1")
+tf1  = input.timeframe("", "TF", group=g1, inline="a1", tooltip="Empty = chart timeframe")
+pr1  = input.string("Fast", "Preset (Per slot mode)", options=["Fast", "Balanced", "High quality", "Manual"], group=g1)
+lb1  = input.string("", "Label prefix (empty = auto, e.g. H1)", group=g1)
+dc1  = input.color(color.new(color.green, 75), "Classic demand", group=g1, inline="c1")
+sc1  = input.color(color.new(color.red, 75), "Classic supply", group=g1, inline="c1")
+g2 = "Slot 2"
+en2  = input.bool(true, "Enable", group=g2, inline="a2")
+tf2  = input.timeframe("240", "TF", group=g2, inline="a2")
+pr2  = input.string("Fast", "Preset (Per slot mode)", options=["Fast", "Balanced", "High quality", "Manual"], group=g2)
+lb2  = input.string("", "Label prefix (empty = auto)", group=g2)
+dc2  = input.color(color.new(color.teal, 75), "Classic demand", group=g2, inline="c2")
+sc2  = input.color(color.new(color.orange, 75), "Classic supply", group=g2, inline="c2")
+g3 = "Slot 3"
+en3  = input.bool(true, "Enable", group=g3, inline="a3")
+tf3  = input.timeframe("D", "TF", group=g3, inline="a3")
+pr3  = input.string("Fast", "Preset (Per slot mode)", options=["Fast", "Balanced", "High quality", "Manual"], group=g3)
+lb3  = input.string("", "Label prefix (empty = auto)", group=g3)
+dc3  = input.color(color.new(color.blue, 70), "Classic demand", group=g3, inline="c3")
+sc3  = input.color(color.new(color.purple, 70), "Classic supply", group=g3, inline="c3")
+
+// ---------------- Common / display ----------------
+grpC = "Common"
+atrLen    = input.int(14, "ATR length (on each zone timeframe)", minval=1, group=grpC)
+legOut    = input.float(0.0, "Leg-out: impulse close must clear zone by x zone height (0 = off)", minval=0.0, step=0.25, group=grpC, tooltip="Quality filter. 1.0 = the impulse candle must close at least one zone-height beyond the zone's proximal edge.")
+zMaxH     = input.float(1.5, "Max zone height (x ATR, 0 = off)", minval=0.0, step=0.25, group=grpC, tooltip="Skips very tall zones (weak, wide SL). Applies to every preset unless the preset has its own limit.")
+noOverlap = input.bool(true, "Overlapping zones: keep only the newest (same side/TF)", group=grpC)
+maxZones  = input.int(10, "Max live zones per side per TF", minval=1, maxval=40, group=grpC)
+brkMode   = input.string("Chart-TF close", "Break confirmation", options=["Chart-TF close", "Zone-TF close"], group=grpC)
+trendOnly = input.bool(false, "Only zones aligned with HTF trend", group=grpC)
+htfTf     = input.timeframe("", "Trend: timeframe (empty = auto)", group=grpC, tooltip="Auto: chart TF below H1 -> H4 trend, H1 and above -> chart TF trend (best backtest results).")
+htfLen    = input.int(200, "Trend: HTF EMA length", minval=1, group=grpC)
+grpD = "Display"
+hideMit    = input.string("Touched", "Hide mitigated zones", options=["Touched", "50% filled", "Off"], group=grpD, tooltip="With signals ON a touched zone stays visible until its confirmation window ends.")
+brokenMode = input.string("Remove", "Broken zones", options=["Remove", "Keep faded"], group=grpD)
+maxBroken  = input.int(30, "Max faded broken zones kept (all TFs)", minval=1, maxval=200, group=grpD)
+brkCol     = input.color(color.new(color.gray, 94), "Broken (faded)", group=grpD)
+showEma    = input.bool(false, "Plot trend HTF EMA", group=grpD)
+
+// ---------------- Helpers ----------------
+type Zone
+    box   bx
+    float top
+    float bot
+    int   side
+    bool  tested
+    int   touchBar
+    bool  used
+    color col
+
+bool premium = theme == "Premium"
+string lblSize = lblSizeIn == "Tiny" ? size.tiny : lblSizeIn == "Normal" ? size.normal : size.small
+string dSize = dashSize == "Tiny" ? size.tiny : dashSize == "Normal" ? size.normal : size.small
+string dPos = dashPos == "Top left" ? position.top_left : dashPos == "Bottom right" ? position.bottom_right : dashPos == "Bottom left" ? position.bottom_left : position.top_right
+
+f_params(string p) =>
+    float imp = p == "Fast" ? 1.0 : p == "Balanced" ? 1.5 : p == "High quality" ? 2.5 : mImp
+    int   mi  = p == "Fast" ? 3 : p == "Balanced" ? 1 : p == "High quality" ? 3 : mMaxImp
+    float bm  = p == "Fast" ? 0.7 : p == "Balanced" ? 0.7 : p == "High quality" ? 0.5 : mBase
+    int   mb  = p == "Fast" ? 3 : p == "Balanced" ? 3 : p == "High quality" ? 3 : mMaxBase
+    float hmn = p == "High quality" ? 0.5 : p == "Manual" ? mHmin : 0.0
+    float hmx = p == "High quality" ? 1.0 : p == "Manual" ? mHmax : 0.0
+    float rt  = p == "Manual" ? mRatio : 0.0
+    [imp, mi, bm, mb, hmn, hmx, rt]
+
+f_tfLabel(string tf) =>
+    int s = timeframe.in_seconds(tf)
+    s >= 604800 ? "W" : s >= 86400 ? "D" : s >= 3600 ? "H" + str.tostring(math.round(s / 3600)) : "M" + str.tostring(math.round(s / 60))
+
+// Zone detector (unchanged from v3 except the optional leg-out filter).
+f_detect(float impM, int maxI, float baseM, int maxB, float hMn, float hMx, float rMin, int aLen, int sh, float legM) =>
+    var int lastUp = -1
+    var int lastDn = -1
+    float a = ta.atr(aLen)
+    int side = 0
+    int q0 = 0
+    float zT = na
+    float zB = na
+    int tStart = na
+    float cAt = na
+    if not na(a[sh])
+        bool allUp = true
+        bool allDn = true
+        for m = 1 to maxI
+            int q = sh + m - 1
+            if bar_index < q
+                break
+            allUp := allUp and close[q] > open[q]
+            allDn := allDn and close[q] < open[q]
+            if not allUp and not allDn
+                break
+            if allUp and close[sh] - open[q] >= impM * a[sh]
+                side := 1
+                q0 := m - 1
+                break
+            if allDn and open[q] - close[sh] >= impM * a[sh]
+                side := -1
+                q0 := m - 1
+                break
+    if side != 0
+        int nB = 0
+        for i = 1 to maxB
+            int off = sh + q0 + i
+            if bar_index < off
+                break
+            if na(a[off])
+                break
+            if math.abs(close[off] - open[off]) <= baseM * a[off]
+                nB += 1
+            else
+                break
+        int beIdx = bar_index - sh - q0 - 1
+        bool dup = side == 1 ? beIdx == lastUp : beIdx == lastDn
+        if nB > 0 and not dup
+            float t0 = -1.0e12
+            float b0 = 1.0e12
+            for i = 1 to nB
+                int off = sh + q0 + i
+                if side == 1
+                    t0 := math.max(t0, math.max(open[off], close[off]))
+                    b0 := math.min(b0, low[off])
+                else
+                    t0 := math.max(t0, high[off])
+                    b0 := math.min(b0, math.min(open[off], close[off]))
+            float hgtAbs = t0 - b0
+            float hgt = hgtAbs / a[sh]
+            float mv = math.abs(close[sh] - open[sh + q0]) / a[sh]
+            bool ok = true
+            if hMn > 0 and hgt < hMn
+                ok := false
+            if hMx > 0 and hgt > hMx
+                ok := false
+            if rMin > 0 and mv < rMin * hgt
+                ok := false
+            if legM > 0
+                float clearD = side == 1 ? close[sh] - t0 : b0 - close[sh]
+                if clearD < legM * hgtAbs
+                    ok := false
+            if ok
+                if side == 1
+                    lastUp := beIdx
+                else
+                    lastDn := beIdx
+                zT := t0
+                zB := b0
+                tStart := time[sh + q0 + nB]
+                cAt := close[sh]
+            else
+                side := 0
+        else
+            side := 0
+    [side, zT, zB, tStart, cAt, time[sh], close[sh]]
+
+// ---------------- Slot settings ----------------
+string tfE1 = tf1 == "" ? timeframe.period : tf1
+string tfE2 = tf2 == "" ? timeframe.period : tf2
+string tfE3 = tf3 == "" ? timeframe.period : tf3
+int chartSec = timeframe.in_seconds(timeframe.period)
+int sec1 = timeframe.in_seconds(tfE1)
+int sec2 = timeframe.in_seconds(tfE2)
+int sec3 = timeframe.in_seconds(tfE3)
+int sh1 = sec1 == chartSec ? 0 : 1
+int sh2 = sec2 == chartSec ? 0 : 1
+int sh3 = sec3 == chartSec ? 0 : 1
+bool low1 = sec1 < chartSec
+bool low2 = sec2 < chartSec
+bool low3 = sec3 < chartSec
+bool dup2 = en1 and not low1 and sec2 == sec1
+bool dup3 = (en1 and not low1 and sec3 == sec1) or (en2 and not low2 and sec3 == sec2)
+bool on1 = en1 and not low1
+bool on2 = en2 and not low2 and not dup2
+bool on3 = en3 and not low3 and not dup3
+string p1 = presetMode == "Shared" ? presetAll : pr1
+string p2 = presetMode == "Shared" ? presetAll : pr2
+string p3 = presetMode == "Shared" ? presetAll : pr3
+string px1 = lb1 == "" ? f_tfLabel(tfE1) : lb1
+string px2 = lb2 == "" ? f_tfLabel(tfE2) : lb2
+string px3 = lb3 == "" ? f_tfLabel(tfE3) : lb3
+[i1, m1, b1, x1, hn1, hx1, r1] = f_params(p1)
+[i2, m2, b2, x2, hn2, hx2, r2] = f_params(p2)
+[i3, m3, b3, x3, hn3, hx3, r3] = f_params(p3)
+color dCol1 = premium ? color.new(premDem, zoneTr) : dc1
+color sCol1 = premium ? color.new(premSup, zoneTr) : sc1
+color dCol2 = premium ? color.new(premDem, zoneTr) : dc2
+color sCol2 = premium ? color.new(premSup, zoneTr) : sc2
+color dCol3 = premium ? color.new(premDem, zoneTr) : dc3
+color sCol3 = premium ? color.new(premSup, zoneTr) : sc3
+bool sig1 = showSig and on1
+bool sig2 = showSig and on2 and sigSrc == "All slots"
+bool sig3 = showSig and on3 and sigSrc == "All slots"
+
+// ---------------- request.security ----------------
+[zs1, zt1, zb1, zst1, zc1, tb1, cl1] = request.security(syminfo.tickerid, tfE1, f_detect(i1, m1, b1, x1, hn1, hx1 > 0 ? hx1 : zMaxH, r1, atrLen, sh1, legOut), lookahead=barmerge.lookahead_on)
+[zs2, zt2, zb2, zst2, zc2, tb2, cl2] = request.security(syminfo.tickerid, tfE2, f_detect(i2, m2, b2, x2, hn2, hx2 > 0 ? hx2 : zMaxH, r2, atrLen, sh2, legOut), lookahead=barmerge.lookahead_on)
+[zs3, zt3, zb3, zst3, zc3, tb3, cl3] = request.security(syminfo.tickerid, tfE3, f_detect(i3, m3, b3, x3, hn3, hx3 > 0 ? hx3 : zMaxH, r3, atrLen, sh3, legOut), lookahead=barmerge.lookahead_on)
+string trendTf = htfTf != "" ? htfTf : timeframe.in_seconds(timeframe.period) < 3600 ? "240" : timeframe.period
+htfEma = request.security(syminfo.tickerid, trendTf, ta.ema(close, htfLen)[1], lookahead=barmerge.lookahead_on)
+
+bool longOK  = not sigTrend or (not na(htfEma) and close > htfEma)
+bool shortOK = not sigTrend or (not na(htfEma) and close < htfEma)
+bool inSess  = not useSess or not na(time(timeframe.period, sessStr, "UTC"))
+float chartAtr = ta.atr(atrLen)
+
+bool nb1 = tb1 != tb1[1]
+bool nb2 = tb2 != tb2[1]
+bool nb3 = tb3 != tb3[1]
+float prevLow = low[1]
+float prevHigh = high[1]
+
+// ---------------- Storage ----------------
+var array<Zone> dz1 = array.new<Zone>()
+var array<Zone> sz1 = array.new<Zone>()
+var array<Zone> dz2 = array.new<Zone>()
+var array<Zone> sz2 = array.new<Zone>()
+var array<Zone> dz3 = array.new<Zone>()
+var array<Zone> sz3 = array.new<Zone>()
+var array<box> brokenBoxes = array.new<box>()
+
+f_txtCol() =>
+    premium ? lblCol : color.new(color.white, 20)
+
+f_text(int side, string pfx, bool isHtf, string state) =>
+    string t = ""
+    if showLbl
+        if premium
+            t := (tfPrefix and isHtf ? pfx + " " : "") + (side == 1 ? demTxt : supTxt)
+        else
+            t := pfx + (side == 1 ? " D " : " S ") + state
+    t
+
+f_fade(color c, int add) =>
+    color.new(c, math.min(100, color.t(c) + add))
+
+f_testedCol(color c) =>
+    premium ? f_fade(c, testedFade) : color.new(c, 88)
+
+// returns [entered, signal, signal zone far edge (raw SL anchor)]
+f_update(array<Zone> zs, int side, string pfx, bool isHtf, color baseCol, bool brkNow, float brkClose, bool sigOn) =>
+    bool entered = false
+    bool sig = false
+    float sigEdge = na
+    int n = array.size(zs)
+    if n > 0
+        for i = n - 1 to 0
+            Zone z = array.get(zs, i)
+            if side == 1 ? (low <= z.top and prevLow > z.top) : (high >= z.bot and prevHigh < z.bot)
+                entered := true
+            if not z.tested and (side == 1 ? low <= z.top : high >= z.bot)
+                z.tested := true
+                z.touchBar := bar_index
+                box.set_bgcolor(z.bx, f_testedCol(baseCol))
+                if not premium
+                    box.set_text(z.bx, f_text(side, pfx, isHtf, "Tested"))
+            if sigOn and z.tested and not z.used
+                if bar_index - z.touchBar > confBars
+                    z.used := true
+                else
+                    float rng = high - low
+                    bool conf = side == 1 ? (low <= z.top and close > z.top) : (high >= z.bot and close < z.bot)
+                    if conf and confType == "Close + body in direction"
+                        conf := side == 1 ? close > open : close < open
+                    if conf and confType == "Pin bar"
+                        conf := rng > 0 and (side == 1 ? math.min(open, close) - low : high - math.max(open, close)) >= wickRatio * rng
+                    if conf
+                        z.used := true
+                        if (side == 1 ? longOK : shortOK) and inSess
+                            sig := true
+                            sigEdge := side == 1 ? (na(sigEdge) ? z.bot : math.max(sigEdge, z.bot)) : (na(sigEdge) ? z.top : math.min(sigEdge, z.top))
+            float mid = (z.top + z.bot) / 2
+            bool mitig = hideMit == "Touched" ? (side == 1 ? low <= z.top : high >= z.bot) : hideMit == "50% filled" ? (side == 1 ? low <= mid : high >= mid) : false
+            bool keepForSig = sigOn and not z.used
+            bool broken = brkNow and (side == 1 ? brkClose < z.bot : brkClose > z.top)
+            // v4.1: a zone whose signal was used (or whose confirmation window expired) is removed - only fresh zones stay
+            if (mitig or (sigOn and z.used)) and not broken and not keepForSig
+                box.delete(z.bx)
+                array.remove(zs, i)
+            else if broken
+                if brokenMode == "Keep faded"
+                    box.set_extend(z.bx, extend.none)
+                    box.set_right(z.bx, time)
+                    box.set_bgcolor(z.bx, brkCol)
+                    box.set_border_color(z.bx, color.new(color.gray, showBorder ? 80 : 100))
+                    box.set_text_color(z.bx, color.new(color.gray, 60))
+                    if not premium
+                        box.set_text(z.bx, f_text(side, pfx, isHtf, "Broken"))
+                    array.push(brokenBoxes, z.bx)
+                    if array.size(brokenBoxes) > maxBroken
+                        box.delete(array.shift(brokenBoxes))
+                else
+                    box.delete(z.bx)
+                array.remove(zs, i)
+            else
+                box.set_right(z.bx, time)
+    [entered, sig, sigEdge]
+
+f_borderCol(color c) =>
+    showBorder ? color.new(c, premium ? borderTr : 30) : color.new(c, 100)
+
+f_addBox(array<Zone> zs, int side, float top, float bot, int tStart, string pfx, bool isHtf, color col) =>
+    color bc = f_borderCol(col)
+    box b = box.new(tStart, top, time, bot, xloc=xloc.bar_time, extend=extRight ? extend.right : extend.none, border_color=bc, border_width=showBorder ? 1 : 0, bgcolor=col, text=f_text(side, pfx, isHtf, "Fresh"), text_size=premium ? lblSize : size.tiny, text_color=f_txtCol(), text_halign=premium ? text.align_center : text.align_right, text_valign=premium ? text.align_center : text.align_top)
+    array.push(zs, Zone.new(b, top, bot, side, false, -1, false, col))
+    if array.size(zs) > maxZones
+        Zone old = array.shift(zs)
+        box.delete(old.bx)
+    true
+
+f_add(array<Zone> zs, int side, float top, float bot, int tStart, string pfx, bool isHtf, color col) =>
+    if noOverlap and array.size(zs) > 0
+        for j = array.size(zs) - 1 to 0
+            Zone w = array.get(zs, j)
+            float ov = math.min(top, w.top) - math.max(bot, w.bot)
+            if ov > 0.5 * math.min(top - bot, w.top - w.bot) and not w.tested
+                box.delete(w.bx)
+                array.remove(zs, j)
+    f_addBox(zs, side, top, bot, tStart, pfx, isHtf, col)
+
+f_slot(bool isOn, int sh, bool isNewBar, int zSide, float zTop, float zBot, int zStart, float zClose, float tfClose, array<Zone> dArr, array<Zone> sArr, string pfx, color dCol, color sCol, bool sigOn) =>
+    bool newD = false
+    bool newS = false
+    bool entD = false
+    bool entS = false
+    bool buy = false
+    bool sell = false
+    float buyE = na
+    float sellE = na
+    if isOn
+        bool isHtf = sh == 1
+        bool trendOK = not trendOnly or (not na(htfEma) and (zSide == 1 ? zClose > htfEma : zClose < htfEma))
+        bool addIt = isNewBar and zSide != 0 and trendOK
+        if addIt and isHtf
+            if zSide == 1
+                newD := f_add(dArr, 1, zTop, zBot, zStart, pfx, isHtf, dCol)
+            else
+                newS := f_add(sArr, -1, zTop, zBot, zStart, pfx, isHtf, sCol)
+        bool brkNow = brkMode == "Chart-TF close" ? true : isNewBar
+        float brkClose = brkMode == "Chart-TF close" ? close : tfClose
+        [eD, sB, eB] = f_update(dArr, 1, pfx, isHtf, dCol, brkNow, brkClose, sigOn)
+        [eS, sS, eSl] = f_update(sArr, -1, pfx, isHtf, sCol, brkNow, brkClose, sigOn)
+        entD := eD
+        entS := eS
+        buy := sB
+        sell := sS
+        buyE := eB
+        sellE := eSl
+        if addIt and not isHtf
+            if zSide == 1
+                newD := f_add(dArr, 1, zTop, zBot, zStart, pfx, isHtf, dCol)
+            else
+                newS := f_add(sArr, -1, zTop, zBot, zStart, pfx, isHtf, sCol)
+    [newD, newS, entD, entS, buy, sell, buyE, sellE]
+
+bool nD1 = false
+bool nS1 = false
+bool eD1 = false
+bool eS1 = false
+bool nD2 = false
+bool nS2 = false
+bool eD2 = false
+bool eS2 = false
+bool nD3 = false
+bool nS3 = false
+bool eD3 = false
+bool eS3 = false
+bool buySig = false
+bool sellSig = false
+float buyEdge = na
+float sellEdge = na
+if barstate.isconfirmed
+    [a1, a2, a3, a4, a5, a6, a7, a8] = f_slot(on1, sh1, nb1, zs1, zt1, zb1, zst1, zc1, cl1, dz1, sz1, px1, dCol1, sCol1, sig1)
+    [c1, c2, c3, c4, c5, c6, c7, c8] = f_slot(on2, sh2, nb2, zs2, zt2, zb2, zst2, zc2, cl2, dz2, sz2, px2, dCol2, sCol2, sig2)
+    [d1, d2, d3, d4, d5, d6, d7, d8] = f_slot(on3, sh3, nb3, zs3, zt3, zb3, zst3, zc3, cl3, dz3, sz3, px3, dCol3, sCol3, sig3)
+    nD1 := a1
+    nS1 := a2
+    eD1 := a3
+    eS1 := a4
+    nD2 := c1
+    nS2 := c2
+    eD2 := c3
+    eS2 := c4
+    nD3 := d1
+    nS3 := d2
+    eD3 := d3
+    eS3 := d4
+    buySig := a5 or c5 or d5
+    sellSig := a6 or c6 or d6
+    buyEdge := a5 ? a7 : c5 ? c7 : d7
+    sellEdge := a6 ? a8 : c6 ? c8 : d8
+
+// =====================================================================================================
+// ---------------- v4 TRADE ENGINE + BACKTEST (one trade at a time, confirmed bars only) ----------------
+// =====================================================================================================
+var bool  inTr   = false
+var int   tDir   = 0
+var float tEn    = na
+var float tSL0   = na
+var float tSL    = na
+var float tRisk  = na
+var float tTP1   = na
+var float tTP2   = na
+var float tTP3   = na
+var bool  tH1    = false
+var bool  tH2    = false
+var int   tBar   = na
+var float tR     = 0.0
+var string lastRes = "-"
+
+var int   nTr    = 0
+var int   nBuy   = 0
+var int   nSell  = 0
+var int   nWin   = 0
+var int   nTP2   = 0
+var int   nTP3   = 0
+var int   nLoss  = 0
+var int   nTime  = 0
+var float sumR   = 0.0
+var float grossW = 0.0
+var float grossL = 0.0
+var int   streak = 0
+var int   maxStreak = 0
+
+var line  lnE = na
+var line  lnS = na
+var line  ln1 = na
+var line  ln2 = na
+var line  ln3 = na
+var label lbE = na
+var label lbS = na
+var label lb1x = na
+var label lb2x = na
+var label lb3x = na
+var label lbSig = na
+
+bool takeBuy  = false
+bool takeSell = false
+bool evTP1 = false
+bool evTP2 = false
+bool evTP3 = false
+bool evSL  = false
+bool evBE  = false
+bool evTime = false
+float third = 1.0 / 3.0
+string fmt = format.mintick
+
+if barstate.isconfirmed and showSig
+    // 1) manage the open trade with this candle (entry was on an earlier candle's close)
+    if inTr and bar_index > tBar
+        bool closed = false
+        string why = ""
+        float rem = 1.0 - (tH1 ? third : 0.0) - (tH2 ? third : 0.0)
+        bool slHit = tDir == 1 ? low <= tSL : high >= tSL
+        if slHit
+            float slR = (tDir == 1 ? tSL - tEn : tEn - tSL) / tRisk
+            tR += rem * slR
+            closed := true
+            why := tH1 ? (tH2 ? "TP2 + trail" : "TP1 + BE") : "SL"
+            if tH1
+                evBE := true
+            else
+                evSL := true
+        else
+            if not tH1 and (tDir == 1 ? high >= tTP1 : low <= tTP1)
+                tH1 := true
+                evTP1 := true
+                tR += third * tp1R
+                if beOn
+                    tSL := tEn
+            if tH1 and not tH2 and (tDir == 1 ? high >= tTP2 : low <= tTP2)
+                tH2 := true
+                evTP2 := true
+                tR += third * tp2R
+                if trailOn
+                    tSL := tTP1
+            if tH2 and (tDir == 1 ? high >= tTP3 : low <= tTP3)
+                tR += third * tp3R
+                closed := true
+                why := "TP3"
+                evTP3 := true
+            else if maxHold > 0 and bar_index - tBar >= maxHold
+                float rem2 = 1.0 - (tH1 ? third : 0.0) - (tH2 ? third : 0.0)
+                tR += rem2 * (tDir == 1 ? close - tEn : tEn - close) / tRisk
+                closed := true
+                why := "Time exit"
+                evTime := true
+        if closed
+            inTr := false
+            nTr += 1
+            if tDir == 1
+                nBuy += 1
+            else
+                nSell += 1
+            if tH1
+                nWin += 1
+            else if why == "SL"
+                nLoss += 1
+            if tH2
+                nTP2 += 1
+            if why == "TP3"
+                nTP3 += 1
+            if why == "Time exit"
+                nTime += 1
+            sumR += tR
+            if tR > 0
+                grossW += tR
+            else
+                grossL -= tR
+            streak := tR < 0 ? streak + 1 : 0
+            maxStreak := math.max(maxStreak, streak)
+            lastRes := (tDir == 1 ? "BUY " : "SELL ") + why + " (" + (tR >= 0 ? "+" : "") + str.tostring(tR, "#.##") + "R)"
+            if showLv and not na(lnE)
+                line.set_x2(lnE, bar_index)
+                line.set_x2(lnS, bar_index)
+                line.set_x2(ln1, bar_index)
+                line.set_x2(ln2, bar_index)
+                line.set_x2(ln3, bar_index)
+            if not showHist
+                line.delete(lnE)
+                line.delete(lnS)
+                line.delete(ln1)
+                line.delete(ln2)
+                line.delete(ln3)
+                label.delete(lbE)
+                label.delete(lbS)
+                label.delete(lb1x)
+                label.delete(lb2x)
+                label.delete(lb3x)
+                label.delete(lbSig)
+                lnE := na
+                lbSig := na
+        else if showLv and not na(lnE)
+            line.set_x2(lnE, bar_index + 8)
+            line.set_x2(lnS, bar_index + 8)
+            line.set_y1(lnS, tSL)
+            line.set_y2(lnS, tSL)
+            line.set_x2(ln1, bar_index + 8)
+            line.set_x2(ln2, bar_index + 8)
+            line.set_x2(ln3, bar_index + 8)
+            label.set_x(lbE, bar_index + 8)
+            label.set_x(lbS, bar_index + 8)
+            label.set_y(lbS, tSL)
+            label.set_text(lbS, (tSL == tEn ? "SL (BE) " : "SL ") + str.tostring(tSL, fmt))
+            label.set_x(lb1x, bar_index + 8)
+            label.set_x(lb2x, bar_index + 8)
+            label.set_x(lb3x, bar_index + 8)
+            label.set_text(lb1x, "TP1 " + str.tostring(tTP1, fmt) + (tH1 ? "  ✓" : ""))
+            label.set_text(lb2x, "TP2 " + str.tostring(tTP2, fmt) + (tH2 ? "  ✓" : ""))
+            // SL moved onto entry (BE) or onto TP1 (trail): hide the separate SL line/label so the entry stays readable
+            bool atBE = tSL == tEn
+            bool atT1 = tSL == tTP1
+            bool hideSL = atBE or atT1
+            line.set_color(lnS, color.new(#EF5350, hideSL ? 100 : 0))
+            label.set_color(lbS, color.new(#EF5350, hideSL ? 100 : 20))
+            label.set_textcolor(lbS, color.new(color.white, hideSL ? 100 : 0))
+            label.set_text(lbE, (tDir == 1 ? "BUY ENTRY " : "SELL ENTRY ") + str.tostring(tEn, fmt) + (atBE ? "  | SL = BE" : ""))
+            label.set_text(lb1x, "TP1 " + str.tostring(tTP1, fmt) + (tH1 ? "  ✓" : "") + (atT1 ? "  | SL here" : ""))
+
+    // 2) open a new trade on a fresh signal
+    if not inTr and (buySig != sellSig)
+        int dir = buySig ? 1 : -1
+        float edge = dir == 1 ? buyEdge : sellEdge
+        float sl = dir == 1 ? edge - slBuf * chartAtr : edge + slBuf * chartAtr
+        float risk = dir == 1 ? close - sl : sl - close
+        bool okR = not na(risk) and risk > 0 and (maxSlAtr <= 0 or risk <= maxSlAtr * chartAtr)
+        if okR
+            inTr := true
+            tDir := dir
+            tEn := close
+            tSL0 := sl
+            tSL := sl
+            tRisk := risk
+            tTP1 := close + dir * tp1R * risk
+            tTP2 := close + dir * tp2R * risk
+            tTP3 := close + dir * tp3R * risk
+            tH1 := false
+            tH2 := false
+            tBar := bar_index
+            tR := 0.0
+            takeBuy := dir == 1
+            takeSell := dir == -1
+            if not showHist
+                label.delete(lbSig)
+                lbSig := label.new(bar_index, dir == 1 ? low : high, dir == 1 ? "BUY" : "SELL", style=dir == 1 ? label.style_label_up : label.style_label_down, color=dir == 1 ? buyCol : sellCol, textcolor=color.white, size=size.small)
+            if showLv
+                line.delete(lnE)
+                line.delete(lnS)
+                line.delete(ln1)
+                line.delete(ln2)
+                line.delete(ln3)
+                label.delete(lbE)
+                label.delete(lbS)
+                label.delete(lb1x)
+                label.delete(lb2x)
+                label.delete(lb3x)
+                color tpc = color.new(#26A69A, 0)
+                lnE := line.new(bar_index, tEn, bar_index + 8, tEn, color=color.new(#FFD54F, 0), width=2)
+                lnS := line.new(bar_index, tSL, bar_index + 8, tSL, color=color.new(#EF5350, 0), width=1)
+                ln1 := line.new(bar_index, tTP1, bar_index + 8, tTP1, color=tpc, style=line.style_dashed, width=1)
+                ln2 := line.new(bar_index, tTP2, bar_index + 8, tTP2, color=tpc, style=line.style_dashed, width=1)
+                ln3 := line.new(bar_index, tTP3, bar_index + 8, tTP3, color=tpc, style=line.style_dashed, width=1)
+                lbE := label.new(bar_index + 8, tEn, (dir == 1 ? "BUY ENTRY " : "SELL ENTRY ") + str.tostring(tEn, fmt), style=label.style_label_left, color=color.new(dir == 1 ? buyCol : sellCol, 10), textcolor=color.white, size=size.tiny)
+                lbS := label.new(bar_index + 8, tSL, "SL " + str.tostring(tSL, fmt), style=label.style_label_left, color=color.new(#EF5350, 20), textcolor=color.white, size=size.tiny)
+                lb1x := label.new(bar_index + 8, tTP1, "TP1 " + str.tostring(tTP1, fmt), style=label.style_label_left, color=color.new(#26A69A, 30), textcolor=color.white, size=size.tiny)
+                lb2x := label.new(bar_index + 8, tTP2, "TP2 " + str.tostring(tTP2, fmt), style=label.style_label_left, color=color.new(#26A69A, 30), textcolor=color.white, size=size.tiny)
+                lb3x := label.new(bar_index + 8, tTP3, "TP3 " + str.tostring(tTP3, fmt), style=label.style_label_left, color=color.new(#26A69A, 30), textcolor=color.white, size=size.tiny)
+
+// ---------------- Dynamic alerts ----------------
+if takeBuy or takeSell
+    alert((takeBuy ? "SDZ BUY " : "SDZ SELL ") + syminfo.ticker + " " + timeframe.period + " | Entry " + str.tostring(tEn, fmt) + " | SL " + str.tostring(tSL0, fmt) + " | TP1 " + str.tostring(tTP1, fmt) + " | TP2 " + str.tostring(tTP2, fmt) + " | TP3 " + str.tostring(tTP3, fmt), alert.freq_once_per_bar_close)
+if evTP1 or evTP2 or evTP3 or evSL or evBE or evTime
+    alert("SDZ " + syminfo.ticker + " " + (evTP3 ? "TP3 hit - trade closed" : evSL ? "SL hit" : evBE ? "Stopped at BE/trail" : evTime ? "Time exit" : evTP2 ? "TP2 hit, SL -> TP1" : "TP1 hit, SL -> breakeven") + " | " + lastRes, alert.freq_once_per_bar_close)
+
+// ---------------- Clean view ----------------
+f_vis(array<Zone> zs, int side) =>
+    int n = array.size(zs)
+    if n > 0
+        for i = 0 to n - 1
+            Zone z = array.get(zs, i)
+            float d = math.max(0.0, side == 1 ? close - z.top : z.bot - close)
+            int rank = 0
+            for j = 0 to n - 1
+                if j != i
+                    Zone w = array.get(zs, j)
+                    float dw = math.max(0.0, side == 1 ? close - w.top : w.bot - close)
+                    if dw < d or (dw == d and j > i)
+                        rank += 1
+            bool vis = rank < nearestN
+            box.set_bgcolor(z.bx, vis ? (z.tested ? f_testedCol(z.col) : z.col) : color.new(z.col, 100))
+            box.set_border_color(z.bx, vis ? f_borderCol(z.col) : color.new(z.col, 100))
+            box.set_text_color(z.bx, vis ? f_txtCol() : color.new(z.col, 100))
+    true
+
+if barstate.islast and nearestN > 0
+    f_vis(dz1, 1)
+    f_vis(sz1, -1)
+    f_vis(dz2, 1)
+    f_vis(sz2, -1)
+    f_vis(dz3, 1)
+    f_vis(sz3, -1)
+
+// ---------------- Gradient cloud ----------------
+float cBasis = ta.ema(close, cloudLen)
+float cAtr   = ta.atr(cloudLen)
+float cStd   = ta.stdev(close, cloudLen)
+float cWidth = ta.sma(cloudMode == "ATR" ? cAtr : cStd, cloudSm)
+float upIn  = cBasis + innerM * cWidth
+float upOut = cBasis + outerM * cWidth
+float loIn  = cBasis - innerM * cWidth
+float loOut = cBasis - outerM * cWidth
+float cPosRaw = upIn - loIn > 0 ? math.max(0.0, math.min(1.0, (close - loIn) / (upIn - loIn))) : 0.5
+float cPos = ta.sma(cPosRaw, cloudSm)
+int cWeak = math.min(100, cloudMax + 40)
+color upTopCol = color.from_gradient(cPos, 0.0, 1.0, color.new(cloudUp, cWeak), color.new(cloudUp, cloudMax))
+color dnBotCol = color.from_gradient(cPos, 0.0, 1.0, color.new(cloudDn, cloudMax), color.new(cloudDn, cWeak))
+pUpOut = plot(cloudOn ? upOut : na, "Cloud upper outer", color=cloudEdge ? color.new(cloudUp, 60) : na, editable=false)
+pUpIn  = plot(cloudOn ? upIn : na, "Cloud upper inner", color=cloudEdge ? color.new(cloudUp, 80) : na, editable=false)
+pLoIn  = plot(cloudOn ? loIn : na, "Cloud lower inner", color=cloudEdge ? color.new(cloudDn, 80) : na, editable=false)
+pLoOut = plot(cloudOn ? loOut : na, "Cloud lower outer", color=cloudEdge ? color.new(cloudDn, 60) : na, editable=false)
+fill(pUpOut, pUpIn, top_value=upOut, bottom_value=upIn, top_color=upTopCol, bottom_color=color.new(cloudUp, 100), title="Upper cloud")
+fill(pLoIn, pLoOut, top_value=loIn, bottom_value=loOut, top_color=color.new(cloudDn, 100), bottom_color=dnBotCol, title="Lower cloud")
+
+plot(showEma ? htfEma : na, "Trend HTF EMA", color=color.new(color.orange, 20), linewidth=1)
+
+// ---------------- Markers (only trades actually taken -> chart matches the stats) ----------------
+plotshape(showHist and takeBuy, "BUY", shape.labelup, location.belowbar, color=buyCol, text="BUY", textcolor=color.white, size=size.small)
+plotshape(showHist and takeSell, "SELL", shape.labeldown, location.abovebar, color=sellCol, text="SELL", textcolor=color.white, size=size.small)
+plotshape(showHist and evTP1, "TP1 hit", shape.circle, location.abovebar, color=color.new(#26A69A, 0), size=size.tiny)
+plotshape(showHist and evSL, "SL hit", shape.xcross, location.abovebar, color=color.new(#EF5350, 0), size=size.tiny)
+
+// ---------------- Static alerts ----------------
+alertcondition(nD1 or nD2 or nD3, "New demand zone (any TF)", "New DEMAND zone {{ticker}} chart {{interval}}")
+alertcondition(nS1 or nS2 or nS3, "New supply zone (any TF)", "New SUPPLY zone {{ticker}} chart {{interval}}")
+alertcondition(eD1 or eD2 or eD3, "Price entered demand zone (any TF)", "Price entered a DEMAND zone {{ticker}} close={{close}}")
+alertcondition(eS1 or eS2 or eS3, "Price entered supply zone (any TF)", "Price entered a SUPPLY zone {{ticker}} close={{close}}")
+alertcondition(takeBuy, "BUY signal", "SDZ BUY {{ticker}} {{interval}} close={{close}}")
+alertcondition(takeSell, "SELL signal", "SDZ SELL {{ticker}} {{interval}} close={{close}}")
+
+// ---------------- Dashboard ----------------
+// nearest unused zone on one side across the signal slots: returns [top, bottom]
+f_near(array<Zone> zs, int side, bool use, float bestD, float bT, float bB) =>
+    float d0 = bestD
+    float t0 = bT
+    float b0 = bB
+    if use
+        int n = array.size(zs)
+        if n > 0
+            for i = 0 to n - 1
+                Zone z = array.get(zs, i)
+                if not z.used
+                    float d = side == 1 ? close - z.top : z.bot - close
+                    d := math.max(0.0, d)
+                    if na(d0) or d < d0
+                        d0 := d
+                        t0 := z.top
+                        b0 := z.bot
+    [d0, t0, b0]
+
+f_p(float v) =>
+    na(v) ? "-" : str.tostring(v, format.mintick)
+
+f_pct(int a, int b) =>
+    b > 0 ? str.tostring(100.0 * a / b, "#.#") + "%" : "-"
+
+var table dash = table.new(dPos, 2, 8, bgcolor=color.new(#131722, 10), frame_color=color.new(#2A2E39, 0), frame_width=1, border_width=0)
+
+f_cell(int c, int r, string t, color tc, color bg) =>
+    table.cell(dash, c, r, t, text_color=tc, text_size=dSize, bgcolor=bg, text_halign=c == 0 ? text.align_left : text.align_right)
+
+if showDash and barstate.islast
+    color tx = color.new(#D1D4DC, 0)
+    color mu = color.new(#787B86, 0)
+    color gr = color.new(#26A69A, 0)
+    color rd = color.new(#EF5350, 0)
+    color nb = color.new(#131722, 100)
+    bool useAll = sigSrc == "All slots"
+    [dd1, dT1, dB1] = f_near(dz1, 1, on1, na, na, na)
+    [dd2, dT2, dB2] = f_near(dz2, 1, on2 and useAll, dd1, dT1, dB1)
+    [dd, dT, dB] = f_near(dz3, 1, on3 and useAll, dd2, dT2, dB2)
+    [sd1, sT1, sB1] = f_near(sz1, -1, on1, na, na, na)
+    [sd2, sT2, sB2] = f_near(sz2, -1, on2 and useAll, sd1, sT1, sB1)
+    [sd, sT, sB] = f_near(sz3, -1, on3 and useAll, sd2, sT2, sB2)
+    bool trendUp = not na(htfEma) and close > htfEma
+    bool allowBuy = not sigTrend or trendUp
+    bool allowSell = not sigTrend or not trendUp
+    // which side to show: the live trade, otherwise the side the trend allows (nearest zone if both allowed)
+    int side = inTr ? tDir : (allowBuy and not allowSell) ? 1 : (allowSell and not allowBuy) ? -1 : na(dd) ? -1 : na(sd) ? 1 : dd <= sd ? 1 : -1
+    float zT = side == 1 ? dT : sT
+    float zB = side == 1 ? dB : sB
+    float pE = side == 1 ? zT : zB
+    float pS = na(zT) ? na : side == 1 ? zB - slBuf * chartAtr : zT + slBuf * chartAtr
+    float pR = na(pS) ? na : math.abs(pE - pS)
+    float vE = inTr ? tEn : pE
+    float vS = inTr ? tSL : pS
+    float v1 = inTr ? tTP1 : na(pR) ? na : pE + side * tp1R * pR
+    float v2 = inTr ? tTP2 : na(pR) ? na : pE + side * tp2R * pR
+    float v3 = inTr ? tTP3 : na(pR) ? na : pE + side * tp3R * pR
+    color sc = side == 1 ? gr : rd
+    string dirTxt = side == 1 ? "BUY" : "SELL"
+    string stL = not showSig ? "Signals OFF" : inTr ? dirTxt + " LIVE" : "WAIT " + dirTxt
+    string stR = inTr ? (tR >= 0 ? "+" : "") + str.tostring(tR, "#.##") + "R" : na(zT) ? "no zone" : "zone " + f_p(zB) + "-" + f_p(zT)
+
+    f_cell(0, 0, "SDZ v4.1  " + f_tfLabel(timeframe.period), tx, nb)
+    f_cell(1, 0, na(htfEma) ? "-" : trendUp ? "▲ BULL" : "▼ BEAR", trendUp ? gr : rd, nb)
+    f_cell(0, 1, stL, color.white, color.new(sc, inTr ? 20 : 60))
+    f_cell(1, 1, stR, color.white, color.new(sc, inTr ? 20 : 60))
+    f_cell(0, 2, inTr ? "Entry" : "Entry ~", mu, nb)
+    f_cell(1, 2, f_p(vE), tx, nb)
+    f_cell(0, 3, "SL", mu, nb)
+    f_cell(1, 3, f_p(vS) + (inTr and tSL == tEn ? " BE" : ""), rd, nb)
+    f_cell(0, 4, "TP1", mu, nb)
+    f_cell(1, 4, f_p(v1) + (inTr and tH1 ? " ✓" : ""), gr, nb)
+    f_cell(0, 5, "TP2", mu, nb)
+    f_cell(1, 5, f_p(v2) + (inTr and tH2 ? " ✓" : ""), gr, nb)
+    f_cell(0, 6, "TP3", mu, nb)
+    f_cell(1, 6, f_p(v3), gr, nb)
+    f_cell(0, 7, "Win " + f_pct(nWin, nTr), mu, nb)
+    f_cell(1, 7, "PF " + (grossL > 0 ? str.tostring(grossW / grossL, "#.##") : "-") + " · " + str.tostring(nTr) + "T", mu, nb)
